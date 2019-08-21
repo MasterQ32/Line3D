@@ -4,6 +4,12 @@
 #include <glm/gtc/quaternion.hpp>
 #include <algorithm>
 
+#include <xnet/socket>
+#include <xnet/dns>
+#include <thread>
+
+#include <set>
+
 #include "mesh.hpp"
 
 #define STR(_X) #_X
@@ -16,6 +22,108 @@
             exit(1); \
         } \
     } while(false)
+
+typedef int OutCode;
+
+const int INSIDE = 0; // 0000
+const int LEFT = 1;   // 0001
+const int RIGHT = 2;  // 0010
+const int BOTTOM = 4; // 0100
+const int TOP = 8;    // 1000
+
+// Compute the bit code for a point (x, y) using the clip rectangle
+// bounded diagonally by (xmin, ymin), and (xmax, ymax)
+
+// ASSUME THAT xmax, xmin, ymax and ymin are global constants.
+
+OutCode ComputeOutCode(float x, float y)
+{
+	OutCode code;
+
+	code = INSIDE;          // initialised as being inside of [[clip window]]
+
+	if (x < -1.0f)           // to the left of clip window
+		code |= LEFT;
+	else if (x > 1.0f)      // to the right of clip window
+		code |= RIGHT;
+	if (y < -1.0f)           // below the clip window
+		code |= BOTTOM;
+	else if (y > 1.0f)      // above the clip window
+		code |= TOP;
+
+	return code;
+}
+
+// Cohen–Sutherland clipping algorithm clips a line from
+// P0 = (x0, y0) to P1 = (x1, y1) against a rectangle with
+// diagonal from (xmin, ymin) to (xmax, ymax).
+bool CohenSutherlandLineClipAndDraw(float & x0, float & y0, float & x1, float & y1)
+{
+	// compute outcodes for P0, P1, and whatever point lies outside the clip rectangle
+	OutCode outcode0 = ComputeOutCode(x0, y0);
+	OutCode outcode1 = ComputeOutCode(x1, y1);
+	bool accept = false;
+
+	while (true) {
+		if (!(outcode0 | outcode1)) {
+			// bitwise OR is 0: both points inside window; trivially accept and exit loop
+			accept = true;
+			break;
+		} else if (outcode0 & outcode1) {
+			// bitwise AND is not 0: both points share an outside zone (LEFT, RIGHT, TOP,
+			// or BOTTOM), so both must be outside window; exit loop (accept is false)
+			break;
+		} else {
+			// failed both tests, so calculate the line segment to clip
+			// from an outside point to an intersection with clip edge
+			float x, y;
+
+			// At least one endpoint is outside the clip rectangle; pick it.
+			OutCode outcodeOut = outcode0 ? outcode0 : outcode1;
+
+			// Now find the intersection point;
+			// use formulas:
+			//   slope = (y1 - y0) / (x1 - x0)
+			//   x = x0 + (1 / slope) * (ym - y0), where ym is ymin or ymax
+			//   y = y0 + slope * (xm - x0), where xm is xmin or xmax
+			// No need to worry about divide-by-zero because, in each case, the
+			// outcode bit being tested guarantees the denominator is non-zero
+			if (outcodeOut & TOP) {           // point is above the clip window
+				x = x0 + (x1 - x0) * (1.0f - y0) / (y1 - y0);
+				y = 1.0f;
+			} else if (outcodeOut & BOTTOM) { // point is below the clip window
+				x = x0 + (x1 - x0) * (-1.0f - y0) / (y1 - y0);
+				y = -1.0f;
+			} else if (outcodeOut & RIGHT) {  // point is to the right of clip window
+				y = y0 + (y1 - y0) * (1.0f - x0) / (x1 - x0);
+				x = 1.0f;
+			} else if (outcodeOut & LEFT) {   // point is to the left of clip window
+				y = y0 + (y1 - y0) * (-1.0f - x0) / (x1 - x0);
+				x = -1.0f;
+			}
+
+			// Now we move outside point to intersection point to clip
+			// and get ready for next pass.
+			if (outcodeOut == outcode0) {
+				x0 = x;
+				y0 = y;
+				outcode0 = ComputeOutCode(x0, y0);
+			} else {
+				x1 = x;
+				y1 = y;
+				outcode1 = ComputeOutCode(x1, y1);
+			}
+		}
+	}
+	if (accept) {
+		// Following functions are left for implementation by user based on
+		// their platform (OpenGL/graphics.h etc.)
+		// DrawRectangle(xmin, ymin, xmax, ymax);
+		// LineSegment(x0, y0, x1, y1);
+        return true;
+	}
+    return false;
+}
 
 int main()
 {
@@ -44,10 +152,67 @@ int main()
     float cameraPan = 0.0f;
     float cameraTilt = 0.0f;
 
+    xnet::socket sock(AF_INET, SOCK_STREAM);
+    sock.connect(xnet::parse_ipv4("129.69.218.130", 3008));
+
+    auto const quack = [&]() {
+        sock.write("\x07", 1);
+    };
+
+    sock.write("Hello, Tek!\r\n", 13);
+
+    auto const moveVector = [&](int x, int y)
+    {
+        unsigned char buf[4];
+        buf[0] = 0x20 + (y / 32);
+        buf[1] = 0x60 + (y % 32);
+        buf[2] = 0x20 + (x / 32);
+        buf[3] = 0x40 + (x % 32);
+        sock.write(buf, sizeof buf);
+    };
+
+    auto const drawLine = [&](int x0, int y0, int x1, int y1)
+    {
+        auto const inBounds = [](int x, int y) {
+            return (x >= 0) and (y >= 0) and (x < 1024) and (y < 780);
+        };
+        if(not inBounds(x0, y0) or not inBounds(x1, y1))
+            return;
+
+        sock.write("\x1D", 1);
+        moveVector(x0, y0);
+        moveVector(x1, y1);
+    };
+
+    int margin = 10;
+    drawLine(margin, margin, 1023, margin);
+    drawLine(1023 - margin, margin, 1023 - margin, 779 - margin);
+    drawLine(1023 - margin, 779 - margin, margin, 779 - margin);
+    drawLine(margin, 779 - margin, margin, margin);
+
+    auto const mapTo = [](SDL_Rect const & rect, glm::vec2 pos) -> SDL_Point
+    {
+        return SDL_Point {
+            int(rect.x + rect.w * (0.5f + 0.5f * pos.x)),
+            int(rect.y + rect.h * (0.5f + 0.5f * pos.y)),
+        };
+    };
+
+    auto const flipY = [](glm::vec2 p) {
+        p.y = -p.y;
+        return p;
+    };
+
+    SDL_Rect const screenRect = { 0, 0, 639, 479 };
+    SDL_Rect const tekRect = { margin, margin, 1023 - margin, 779 - margin };
+
+    quack();
 
     while(true)
     {
         auto const startOfFrame = SDL_GetTicks();
+
+        bool renderOnTek = false;
 
         SDL_Event ev;
         while(SDL_PollEvent(&ev))
@@ -57,6 +222,8 @@ int main()
             case SDL_KEYDOWN:
                 if(ev.key.keysym.sym == SDLK_ESCAPE)
                     goto _stop;
+                if(ev.key.keysym.sym == SDLK_SPACE)
+                    renderOnTek = true;
                 break;
             case SDL_QUIT:
                 goto _stop;
@@ -80,10 +247,9 @@ int main()
         auto const cameraUp  = cameraRot * glm::vec3(0,1,0);
         auto const cameraForward = cameraRot * glm::vec3(0,0,-1);
 
-        cameraPos += cameraLeft * float((keys[SDL_SCANCODE_A]?1:0) - (keys[SDL_SCANCODE_D]?1:0));
+        cameraPos += cameraLeft * float((keys[SDL_SCANCODE_D]?1:0) - (keys[SDL_SCANCODE_A]?1:0));
         cameraPos += cameraUp * float((keys[SDL_SCANCODE_HOME]?1:0) - (keys[SDL_SCANCODE_END]?1:0));
         cameraPos += cameraForward * float((keys[SDL_SCANCODE_W]|keys[SDL_SCANCODE_UP]?1:0) - (keys[SDL_SCANCODE_S]|keys[SDL_SCANCODE_DOWN]?1:0));
-
 
         auto const matPersp = glm::perspectiveFov<float>(
             glm::radians(60.0f),
@@ -105,6 +271,24 @@ int main()
         SDL_SetRenderDrawColor(ren, 0x00, 0x00, 0x80, 0xFF);
         SDL_RenderClear(ren);
 
+        struct Line
+        {
+            glm::vec2 a, b;
+
+            Line() = default;
+            Line(glm::vec2 _a, glm::vec2 _b) : a(_a), b(_b)
+            {
+                if((a.x < b.x) or ((a.x == b.x) and (a.y < b.y)))
+                    std::swap(a, b);
+            }
+
+            bool operator<(Line const & o) const {
+                return a.x < o.a.x or a.y < o.a.y;
+            }
+        };
+
+        std::vector<Line> lines;
+        lines.reserve(10000);
 
         for(auto const & face : mesh->faces)
         {
@@ -126,19 +310,50 @@ int main()
                 if(start.position.z >= 1.0f or end.position.z >= 1.0f)
                     continue;
 
-                int x0 = int(w * (0.5f + 0.5f * start.position.x));
-                int y0 = int(h * (0.5f - 0.5f * start.position.y));
-                int x1 = int(w * (0.5f + 0.5f * end.position.x));
-                int y1 = int(h * (0.5f - 0.5f * end.position.y));
+                Line l(start.position, end.position);
 
-                SDL_SetRenderDrawColor(ren, 0xFF, 0xFF, 0xFF, 0xFF);
-                SDL_RenderDrawLine(
-                    ren,
-                    x0, y0,
-                    x1, y1
-                );
+                if(not CohenSutherlandLineClipAndDraw(l.a.x, l.a.y, l.b.x, l.b.y))
+                    continue;
+
+                bool contain = false;
+                for(size_t i = 0; i < lines.size(); i++) {
+                    if(glm::distance(lines[0].a, l.a) > 0.001f)
+                        continue;
+                    if(glm::distance(lines[0].b, l.b) > 0.001f)
+                        continue;
+                    contain = true;
+                    break;
+                }
+
+                if(not contain)
+                    lines.emplace_back(l);
             }
         }
+
+        // clip lines against polygons here!
+
+        for(Line const & line : lines)
+        {
+            auto const scr0 = mapTo(screenRect, flipY(line.a));
+            auto const scr1 = mapTo(screenRect, flipY(line.b));
+
+            SDL_SetRenderDrawColor(ren, 0xFF, 0xFF, 0xFF, 0xFF);
+            SDL_RenderDrawLine(
+                ren,
+                scr0.x, scr0.y,
+                scr1.x, scr1.y
+            );
+
+            if(renderOnTek) {
+                auto const tek0 = mapTo(tekRect, line.a);
+                auto const tek1 = mapTo(tekRect, line.b);
+
+                drawLine(tek0.x, tek0.y, tek1.x, tek1.y);
+            }
+        }
+
+        if(renderOnTek)
+            quack();
 
         SDL_RenderPresent(ren);
 
